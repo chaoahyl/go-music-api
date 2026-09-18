@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -630,6 +631,7 @@ func InspectMusic(c *gin.Context) {
 // @Param artist query string false "歌手名称" default(胡杨林) example(胡杨林)
 // @Param source query string true "当前损坏的音源(将跳过此源搜索)" default(netease) example(netease)
 // @Param target query string false "指定目标尝试的音源，为空则遍历主流平台搜索" default() example()
+// @Param sources query []string false "参与竞速的平台；可重复传递，默认除当前源外的全部音乐平台" collectionFormat(multi)
 // @Param duration query string false "原音频时长(秒)，提供此时长可极大提高匹配准确度" default(290) example(290)
 // @Success 200 {object} model.Song "成功找到高匹配度的可用歌曲"
 // @Failure 400 {object} Response "参数错误(缺失歌名)"
@@ -654,24 +656,25 @@ func SwitchSource(c *gin.Context) {
 		keyword = name + " " + artist
 	}
 
-	var sources []string
-	if target != "" {
-		sources = []string{target}
-	} else {
-		sources = []string{"netease", "qq", "kugou", "kuwo", "migu", "bilibili"}
-	}
+	sources := switchSources(c, target)
 
 	type candidate struct {
 		song    model.Song
 		score   float64
 		durDiff int
 	}
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var candidates []candidate
+	type sourceResult struct {
+		candidate candidate
+		found     bool
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	results := make(chan sourceResult, len(sources))
+	pending := 0
 
 	for _, src := range sources {
-		if src == "" || src == current || src == "soda" || src == "fivesing" {
+		if src == "" || src == current {
 			continue
 		}
 		fn := service.GetSearchFunc(src)
@@ -679,9 +682,15 @@ func SwitchSource(c *gin.Context) {
 			continue
 		}
 
-		wg.Add(1)
+		pending++
 		go func(s string) {
-			defer wg.Done()
+			result := sourceResult{}
+			defer func() {
+				select {
+				case results <- result:
+				case <-ctx.Done():
+				}
+			}()
 			res, err := fn(keyword)
 			if (err != nil || len(res) == 0) && artist != "" {
 				res, _ = fn(name)
@@ -695,68 +704,71 @@ func SwitchSource(c *gin.Context) {
 				limit = 8
 			}
 
+			candidates := make([]candidate, 0, limit)
 			for i := 0; i < limit; i++ {
 				cand := res[i]
 				cand.Source = s
-				score := calcSongSimilarity(name, artist, cand.Name, cand.Artist)
-				if score <= 0 {
+				score := calcSongSimilarity(name, artist, cand.Name, cand.Artist, s)
+				if score < 0.82 || rejectedSwitchVersion(name, cand.Name) {
 					continue
 				}
 
 				durDiff := 0
 				if origDuration > 0 && cand.Duration > 0 {
 					durDiff = intAbs(origDuration - cand.Duration)
-					if !isDurationClose(origDuration, cand.Duration) {
+					if !isStrictDurationClose(origDuration, cand.Duration) {
 						continue
 					}
 				}
-
-				mu.Lock()
 				candidates = append(candidates, candidate{song: cand, score: score, durDiff: durDiff})
-				mu.Unlock()
+			}
+
+			sort.SliceStable(candidates, func(i, j int) bool {
+				if candidates[i].score == candidates[j].score {
+					return candidates[i].durDiff < candidates[j].durDiff
+				}
+				return candidates[i].score > candidates[j].score
+			})
+			for _, cand := range candidates {
+				if validatePlayableContext(ctx, &cand.song) {
+					result = sourceResult{candidate: cand, found: true}
+					return
+				}
 			}
 		}(src)
 	}
-	wg.Wait()
 
-	if len(candidates) == 0 {
-		c.JSON(404, gin.H{"error": "no match"})
+	if pending == 0 {
+		c.JSON(404, gin.H{"error": "no source available"})
 		return
 	}
 
-	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].score == candidates[j].score {
-			return candidates[i].durDiff < candidates[j].durDiff
-		}
-		return candidates[i].score > candidates[j].score
-	})
-
-	var selected *model.Song
-	var selectedScore float64
-	for _, cand := range candidates {
-		if validatePlayable(&cand.song) {
-			tmp := cand.song
-			selected = &tmp
-			selectedScore = cand.score
-			break
+	for completed := 0; completed < pending; completed++ {
+		select {
+		case result := <-results:
+			if !result.found {
+				continue
+			}
+			cancel()
+			selected := result.candidate.song
+			c.JSON(200, gin.H{
+				"id":       selected.ID,
+				"name":     selected.Name,
+				"artist":   selected.Artist,
+				"album":    selected.Album,
+				"duration": selected.Duration,
+				"source":   selected.Source,
+				"cover":    selected.Cover,
+				"score":    result.candidate.score,
+				"link":     selected.Link,
+			})
+			return
+		case <-ctx.Done():
+			c.JSON(404, gin.H{"error": "source race timed out"})
+			return
 		}
 	}
-	if selected == nil {
-		c.JSON(404, gin.H{"error": "no playable match"})
-		return
-	}
-
-	c.JSON(200, gin.H{
-		"id":       selected.ID,
-		"name":     selected.Name,
-		"artist":   selected.Artist,
-		"album":    selected.Album,
-		"duration": selected.Duration,
-		"source":   selected.Source,
-		"cover":    selected.Cover,
-		"score":    selectedScore,
-		"link":     selected.Link,
-	})
+	c.JSON(404, gin.H{"error": "no playable match"})
 }
 
 // GetMusicUrl 辅助 API：获取音频裸直链
@@ -1139,18 +1151,85 @@ func GetUserPlaylists(c *gin.Context) {
 // 算法与校验辅助函数 (用于 SwitchSource)
 // ==========================================
 
-func validatePlayable(song *model.Song) bool {
+func switchSources(c *gin.Context, target string) []string {
+	allowed := make(map[string]bool)
+	for _, source := range service.GetAllSourceNames() {
+		allowed[source] = true
+	}
+	if target != "" {
+		target = strings.ToLower(strings.TrimSpace(target))
+		if allowed[target] {
+			return []string{target}
+		}
+		return nil
+	}
+	rawSources := c.QueryArray("sources")
+	if len(rawSources) == 0 {
+		return service.GetAllSourceNames()
+	}
+	seen := make(map[string]bool)
+	sources := make([]string, 0, len(rawSources))
+	for _, raw := range rawSources {
+		for _, part := range strings.Split(raw, ",") {
+			source := strings.ToLower(strings.TrimSpace(part))
+			if !allowed[source] || seen[source] {
+				continue
+			}
+			seen[source] = true
+			sources = append(sources, source)
+		}
+	}
+	return sources
+}
+
+func rejectedSwitchVersion(targetName, candidateName string) bool {
+	target := normalizeText(targetName)
+	candidate := normalizeText(candidateName)
+	keywords := []string{
+		"伴奏", "翻唱", "纯音乐", "純音樂", "钢琴", "鋼琴", "吉他",
+		"教学", "教學", "reaction", "cover", "live", "现场", "現場",
+		"加速", "慢速", "remix", "demo", "dj", "8d",
+	}
+	for _, keyword := range keywords {
+		if strings.Contains(candidate, keyword) && !strings.Contains(target, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+func isStrictDurationClose(a, b int) bool {
+	if a <= 0 || b <= 0 {
+		return true
+	}
+	diff := intAbs(a - b)
+	maxAllowed := int(float64(a) * 0.04)
+	if maxAllowed < 8 {
+		maxAllowed = 8
+	}
+	return diff <= maxAllowed
+}
+
+func validatePlayableContext(ctx context.Context, song *model.Song) bool {
 	if song == nil || song.ID == "" || song.Source == "" {
 		return false
 	}
-	if song.Source == "soda" || song.Source == "fivesing" {
-		return false
+	var urlStr string
+	var err error
+	if song.Source == "soda" {
+		cookie := service.CM.Get("soda")
+		info, infoErr := soda.New(cookie).GetDownloadInfo(song)
+		if infoErr != nil {
+			return false
+		}
+		urlStr = info.URL
+	} else {
+		fn := service.GetDownloadFunc(song.Source)
+		if fn == nil {
+			return false
+		}
+		urlStr, err = fn(song)
 	}
-	fn := service.GetDownloadFunc(song.Source)
-	if fn == nil {
-		return false
-	}
-	urlStr, err := fn(&model.Song{ID: song.ID, Source: song.Source})
 	if err != nil || urlStr == "" {
 		return false
 	}
@@ -1158,13 +1237,35 @@ func validatePlayable(song *model.Song) bool {
 	if err != nil {
 		return false
 	}
+	req = req.WithContext(ctx)
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return false
 	}
 	defer resp.Body.Close()
-	return resp.StatusCode == 200 || resp.StatusCode == 206
+	contentType := strings.ToLower(strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0]))
+	isMedia := strings.HasPrefix(contentType, "audio/") || contentType == "video/mp4" || contentType == "application/octet-stream"
+	validRange := resp.StatusCode != 206 || strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Range")), "bytes ")
+	return (resp.StatusCode == 200 || resp.StatusCode == 206) && isMedia && validRange && isLikelyFullSongResponse(song, resp)
+}
+
+func responseTotalSize(resp *http.Response) int64 {
+	contentRange := resp.Header.Get("Content-Range")
+	if slash := strings.LastIndex(contentRange, "/"); slash >= 0 && slash+1 < len(contentRange) {
+		if size, err := strconv.ParseInt(contentRange[slash+1:], 10, 64); err == nil {
+			return size
+		}
+	}
+	return resp.ContentLength
+}
+
+func isLikelyFullSongResponse(song *model.Song, resp *http.Response) bool {
+	if song == nil || song.Duration <= 45 {
+		return true
+	}
+	totalSize := responseTotalSize(resp)
+	return totalSize <= 0 || totalSize >= int64(song.Duration)*4000
 }
 
 func intAbs(x int) int {
@@ -1174,28 +1275,16 @@ func intAbs(x int) int {
 	return x
 }
 
-func isDurationClose(a, b int) bool {
-	if a <= 0 || b <= 0 {
-		return true
-	}
-	diff := intAbs(a - b)
-	if diff <= 10 {
-		return true
-	}
-	maxAllowed := int(float64(a) * 0.15)
-	if maxAllowed < 10 {
-		maxAllowed = 10
-	}
-	return diff <= maxAllowed
-}
-
-func calcSongSimilarity(name, artist, candName, candArtist string) float64 {
+func calcSongSimilarity(name, artist, candName, candArtist, source string) float64 {
 	nameA := normalizeText(name)
 	nameB := normalizeText(candName)
 	if nameA == "" || nameB == "" {
 		return 0
 	}
 	nameSim := similarityScore(nameA, nameB)
+	if strings.Contains(nameB, nameA) {
+		nameSim = 1
+	}
 
 	artistA := normalizeText(artist)
 	artistB := normalizeText(candArtist)
@@ -1203,6 +1292,9 @@ func calcSongSimilarity(name, artist, candName, candArtist string) float64 {
 		return nameSim
 	}
 	artistSim := similarityScore(artistA, artistB)
+	if strings.Contains(artistB, artistA) || (source == "bilibili" && strings.Contains(nameB, artistA)) {
+		artistSim = 1
+	}
 	return nameSim*0.7 + artistSim*0.3
 }
 

@@ -378,6 +378,13 @@ paths:
         in: query
         name: target
         type: string
+      - collectionFormat: multi
+        description: 参与竞速的平台；可重复传递，默认除当前源外的全部音乐平台
+        in: query
+        items:
+          type: string
+        name: sources
+        type: array
       - default: "290"
         description: 原音频时长(秒)，提供此时长可极大提高匹配准确度
         example: "290"

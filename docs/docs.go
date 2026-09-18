@@ -462,6 +462,16 @@ const docTemplate = `{
                         "in": "query"
                     },
                     {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "collectionFormat": "multi",
+                        "description": "参与竞速的平台；可重复传递，默认除当前源外的全部音乐平台",
+                        "name": "sources",
+                        "in": "query"
+                    },
+                    {
                         "type": "string",
                         "default": "290",
                         "example": "290",
