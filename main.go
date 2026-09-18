@@ -7,6 +7,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/guohuiyuan/go-music-api/router"
 	"github.com/guohuiyuan/go-music-api/service"
@@ -18,9 +19,14 @@ func main() {
 
 	r := router.SetupRouter()
 
-	fmt.Println("Music API Server is running on http://localhost:8080")
-	fmt.Println("Swagger API 接口文档请访问: http://localhost:8080/swagger/index.html")
-	if err := r.Run(":8080"); err != nil {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	fmt.Printf("Music API Server is running on http://localhost:%s\n", port)
+	fmt.Printf("Swagger API 接口文档请访问: http://localhost:%s/swagger/index.html\n", port)
+	if err := r.Run(":" + port); err != nil {
 		panic("Failed to start server: " + err.Error())
 	}
 }
